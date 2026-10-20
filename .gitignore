@@ -1,0 +1,12 @@
+.fcc_browser_profile/
+.fcc_curriculum_cache/
+.fcc_progress.json
+.fcc_progress.json.tmp
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+fcc_failed_step.png
+fcc_editor_diagnostic.txt
