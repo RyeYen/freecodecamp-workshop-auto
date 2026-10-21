@@ -157,7 +157,7 @@ python fcc_workshop_auto.py --url "https://www.freecodecamp.org/learn/javascript
 python fcc_workshop_auto.py --url "https://www.freecodecamp.org/learn/javascript-v9/workshop-todo-app/step-1" --no-login-pause
 ```
 
-脚本会等待课程编辑器加载，自动关闭已识别的项目预览，再分别展开并填写 `index.html`、`styles.css`、`script.js`。每份代码写入后都会核对；多个编辑器同时显示时，也会按文件名选择对应编辑器。
+脚本会等待课程编辑器加载，自动关闭已识别的项目预览，再分别展开并填写 `index.html`、`styles.css`、`script.js`。写入与延迟核对会绑定到对应文件的同一个编辑器实例；即使页面把焦点切回 JS，也会继续核对原来的 HTML/CSS 文件。源码内容确实不一致时仍会停止。
 
 ## 4. 只查看参考代码，不提交
 
@@ -224,6 +224,8 @@ freeCodeCamp 页面 URL
 检查浏览器是否已打开正确的练习页面、是否完成登录、是否被其他弹窗遮挡，以及编辑器是否加载完成。失败后检查 `fcc_editor_diagnostic.txt` 和 `fcc_failed_step.png`。
 
 若旧版本进入多文件课程立即提示“找不到 html 文件标签”，而诊断中的标题、编辑器、按钮都为空，说明脚本在应用界面加载前就开始查找。更新后会先等待编辑器和文件标签；已识别的项目预览也会自动关闭。诊断中另会记录每个文件标签的展开状态。
+
+若旧版本连续运行 Todo App 时出现“预期 2296 字符，实际 2208 字符”，可能是核对 HTML 时焦点已切回 JS，读到了另一个文件。新版本会固定核对目标实例；更新后用报错步骤的 `/step-N` 地址继续即可，无需从第 1 步重做。
 
 ### 停在捐赠弹窗页面
 

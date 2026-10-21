@@ -271,7 +271,9 @@ class MultiFileEditorTests(unittest.TestCase):
         self.assertEqual(focus.call_args_list, [unittest.mock.call(self.page)] + [
             unittest.mock.call(self.page, language=language) for language in files
         ])
-        self.assertEqual(replace.call_args_list, [unittest.mock.call(self.page, code) for code in files.values()])
+        self.assertEqual(replace.call_args_list, [
+            unittest.mock.call(self.page, code, language=language) for language, code in files.items()
+        ])
 
     def test_missing_file_stops_before_writing_to_another_editor(self):
         with patch.object(fcc, "wait_for_editable_editor"), \
@@ -298,41 +300,69 @@ class EditorReplacementTests(unittest.TestCase):
     def setUp(self):
         self.page = Mock()
         self.code = "function addTwoAndSeven() {  \n  \n}\n"
+        self.handle = self.page.evaluate_handle.return_value
+        self.root = self.handle.as_element.return_value
 
     def test_paste_and_readback_preserve_code_with_crlf(self):
-        self.page.evaluate.side_effect = [None, True, self.code.replace("\n", "\r\n")]
+        self.handle.as_element.return_value = None
+        self.page.evaluate.side_effect = [True, self.code.replace("\n", "\r\n")]
         fcc.replace_editor_code(self.page, self.code)
         self.page.keyboard.insert_text.assert_not_called()
         self.assertEqual(self.page.keyboard.press.call_args_list, [
             unittest.mock.call("ControlOrMeta+A"), unittest.mock.call("ControlOrMeta+A"),
         ])
-        self.assertIn("ClipboardEvent('paste'", self.page.evaluate.call_args_list[1].args[0])
-        self.assertEqual(self.page.evaluate.call_args_list[1].args[1], self.code)
-        self.assertIn("ClipboardEvent('copy'", self.page.evaluate.call_args_list[2].args[0])
+        self.assertIn("ClipboardEvent('paste'", self.page.evaluate.call_args_list[0].args[0])
+        self.assertEqual(self.page.evaluate.call_args_list[0].args[1], self.code)
+        self.assertIn("ClipboardEvent('copy'", self.page.evaluate.call_args_list[1].args[0])
 
     def test_monaco_model_replaces_entire_file_without_keyboard_or_clipboard(self):
-        self.page.evaluate.side_effect = [self.code, self.code]
+        self.root.evaluate.side_effect = [self.code, self.code]
         self.assertEqual(fcc.replace_editor_code(self.page, self.code), "Monaco 完整文件接口")
         self.page.keyboard.press.assert_not_called()
         self.page.keyboard.insert_text.assert_not_called()
-        self.assertEqual(self.page.evaluate.call_args_list[0].args[1], self.code)
-        self.assertIsNone(self.page.evaluate.call_args_list[1].args[1])
+        self.assertEqual(self.root.evaluate.call_args_list[0].args[1], self.code)
+        self.assertIsNone(self.root.evaluate.call_args_list[1].args[1])
+        self.handle.dispose.assert_called_once()
+
+    def test_focus_switch_to_js_does_not_change_html_verification_target(self):
+        expected = "<h1>Todo</h1>\n"
+        self.root.evaluate.side_effect = [expected, expected]
+        self.page.evaluate.return_value = "const taskForm = {};\n"
+        self.assertEqual(fcc.replace_editor_code(self.page, expected), "Monaco 完整文件接口")
+        self.page.evaluate.assert_not_called()
+        self.handle.dispose.assert_called_once()
+
+    def test_named_file_is_bound_before_writing_even_if_focus_is_elsewhere(self):
+        roots = Mock()
+        roots.count.return_value = 1
+        roots.nth.return_value.is_visible.return_value = True
+        handle = roots.nth.return_value.element_handle.return_value
+        root = handle.as_element.return_value
+        root.evaluate.side_effect = [self.code, self.code]
+        with patch.object(fcc, "monaco_roots_for_language", return_value=roots):
+            self.assertTrue(fcc.replace_monaco_code(self.page, self.code, language="html"))
+        self.page.evaluate_handle.assert_not_called()
+        self.page.evaluate.assert_not_called()
+        handle.dispose.assert_called_once()
 
     def test_monaco_model_rejects_late_overwrite_by_old_code(self):
-        self.page.evaluate.side_effect = [self.code, self.code + "    \n}\n"]
+        self.root.evaluate.side_effect = [self.code, self.code + "    \n}\n"]
         with self.assertRaisesRegex(fcc.UnsupportedChallenge, "内容与参考代码不一致"):
             fcc.replace_editor_code(self.page, self.code)
         self.page.keyboard.insert_text.assert_not_called()
+        self.handle.dispose.assert_called_once()
 
     def test_extra_brace_or_changed_whitespace_stops_before_testing(self):
         for actual in (self.code + "}", self.code.replace("  \n", "    \n"), self.code[:-2]):
             with self.subTest(actual=actual):
-                self.page.evaluate.side_effect = [None, True, actual]
+                self.handle.as_element.return_value = None
+                self.page.evaluate.side_effect = [True, actual]
                 with self.assertRaisesRegex(fcc.UnsupportedChallenge, "内容与参考代码不一致"):
                     fcc.replace_editor_code(self.page, self.code)
 
     def test_unhandled_paste_or_copy_is_rejected(self):
-        for responses, message in (([None, False], "未接收整段粘贴"), ([None, True, None], "无法读回编辑器内容")):
+        self.handle.as_element.return_value = None
+        for responses, message in (([False], "未接收整段粘贴"), ([True, None], "无法读回编辑器内容")):
             with self.subTest(responses=responses):
                 self.page.evaluate.side_effect = responses
                 with self.assertRaisesRegex(fcc.UnsupportedChallenge, message):

@@ -534,11 +534,10 @@ def wait_for_editable_editor(page, timeout_ms: int = 45000, *, language: str | N
     raise UnsupportedChallenge(f"{timeout_ms / 1000:g} 秒内没有找到{target}可编辑的代码区域。" + hint)
 
 
-def monaco_model_contents(page, replacement: str | None = None) -> str | None:
-    """只访问当前编辑器实例，用 Monaco 自身接口读写完整文件。"""
-    return page.evaluate("""replacement => {
-        const root = document.activeElement?.closest('.monaco-editor');
-        if (!root) return null;
+def monaco_model_contents(page, replacement: str | None = None, *, editor_root=None) -> str | None:
+    """用 Monaco 接口读写完整文件；可固定 DOM 根节点，避免核对时跟随焦点。"""
+    script = """(root, replacement) => {
+        if (!root?.isConnected) return null;
         const matches = editor => editor
             && typeof editor.getModel === 'function'
             && typeof editor.getValue === 'function'
@@ -570,7 +569,13 @@ def monaco_model_contents(page, replacement: str | None = None) -> str | None:
             }
         }
         return null;
-    }""", replacement)
+    }"""
+    if editor_root is not None:
+        return editor_root.evaluate(script, replacement)
+    return page.evaluate(
+        f"replacement => ({script})(document.activeElement?.closest('.monaco-editor'), replacement)",
+        replacement,
+    )
 
 
 def verify_editor_contents(actual: str | None, expected: str) -> None:
@@ -586,14 +591,37 @@ def verify_editor_contents(actual: str | None, expected: str) -> None:
         )
 
 
-def replace_editor_code(page, code: str) -> str:
-    """优先替换完整 Monaco 模型；无实例接口时才使用粘贴并校验。"""
-    actual = monaco_model_contents(page, code)
-    if actual is not None:
+def replace_monaco_code(page, code: str, language: str | None = None) -> bool:
+    """固定目标文件的 DOM 实例，使写入和延迟核对不受其他文件抢焦点影响。"""
+    if language is not None:
+        roots = monaco_roots_for_language(page, language)
+        visible = [roots.nth(i) for i in range(roots.count()) if roots.nth(i).is_visible()]
+        if len(visible) > 1:
+            raise UnsupportedChallenge(f"发现多个可见的 {language} 编辑器，无法可靠区分。")
+        handle = visible[0].element_handle() if visible else None
+    else:
+        handle = page.evaluate_handle("() => document.activeElement?.closest('.monaco-editor') || null")
+    if handle is None:
+        return False
+    try:
+        root = handle.as_element()
+        if root is None:
+            return False
+        actual = monaco_model_contents(page, code, editor_root=root)
+        if actual is None:
+            return False
         verify_editor_contents(actual, code)
-        # 给 React 的内容变更回调一次更新机会，再次核对，防止加载中的旧状态覆盖。
+        # 核对同一个文件。站点可能将焦点自动切回本题的 JS 编辑区。
         page.wait_for_timeout(250)
-        verify_editor_contents(monaco_model_contents(page), code)
+        verify_editor_contents(monaco_model_contents(page, editor_root=root), code)
+        return True
+    finally:
+        handle.dispose()
+
+
+def replace_editor_code(page, code: str, *, language: str | None = None) -> str:
+    """优先替换固定的 Monaco 实例；无实例接口时才使用粘贴并校验。"""
+    if replace_monaco_code(page, code, language):
         return "Monaco 完整文件接口"
 
     page.keyboard.press("ControlOrMeta+A")
@@ -640,7 +668,7 @@ def write_code(page, files: dict[str, str]) -> None:
             )
 
         editor_type = wait_for_editable_editor(page, language=language if len(files) > 1 else None)
-        method = replace_editor_code(page, code)
+        method = replace_editor_code(page, code, language=language if len(files) > 1 else None)
         print(f"    使用 {editor_type} 定位，通过{method}替换并核对 {language}（{len(code)} 字符）")
 
 
