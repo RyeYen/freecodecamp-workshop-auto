@@ -222,6 +222,78 @@ class CachedCurriculumTests(unittest.TestCase):
                         self.assertTrue(all("--fcc-editable-region--" not in code for code in files.values()))
 
 
+class MultiFileEditorTests(unittest.TestCase):
+    def setUp(self):
+        self.page = Mock()
+        self.modals = patch.object(fcc, "dismiss_known_modals")
+        self.modals.start()
+        self.addCleanup(self.modals.stop)
+
+    def file_buttons(self, count=1):
+        buttons = Mock()
+        buttons.count.return_value = count
+        button = buttons.nth.return_value
+        button.is_visible.return_value = True
+        button.is_enabled.return_value = True
+        button.get_attribute.return_value = None
+        self.page.get_by_role.return_value = buttons
+        return buttons, button
+
+    def test_waits_for_file_tabs_instead_of_failing_on_empty_page(self):
+        buttons, button = self.file_buttons()
+        buttons.count.side_effect = [0, 0, 0, 1]
+        with patch.object(fcc.time, "monotonic", side_effect=[0, 0, 0.3]):
+            self.assertTrue(fcc.choose_file_tab(self.page, "html"))
+        self.page.wait_for_timeout.assert_called_once_with(300)
+        button.click.assert_called_once()
+
+    def test_already_expanded_file_is_not_toggled_closed(self):
+        for attributes in ({"aria-expanded": "true"}, {"aria-selected": "true"}):
+            with self.subTest(attributes=attributes):
+                _, button = self.file_buttons()
+                button.get_attribute.side_effect = attributes.get
+                self.assertTrue(fcc.choose_file_tab(self.page, "css"))
+                button.click.assert_not_called()
+
+    def test_ambiguous_file_tabs_stop_without_clicking(self):
+        _, button = self.file_buttons(count=2)
+        with self.assertRaisesRegex(fcc.UnsupportedChallenge, "多个可见的 html 文件标签"):
+            fcc.choose_file_tab(self.page, "html")
+        button.click.assert_not_called()
+
+    def test_each_file_gets_its_own_editor(self):
+        files = {"html": "<h1>Todo</h1>\n", "css": "h1 {color: red}\n", "js": "const taskForm = {};\n"}
+        with patch.object(fcc, "wait_for_editable_editor", return_value="test editor") as focus, \
+                patch.object(fcc, "choose_file_tab", return_value=True), \
+                patch.object(fcc, "replace_editor_code", return_value="test API") as replace, \
+                redirect_stdout(io.StringIO()):
+            fcc.write_code(self.page, files)
+        self.assertEqual(focus.call_args_list, [unittest.mock.call(self.page)] + [
+            unittest.mock.call(self.page, language=language) for language in files
+        ])
+        self.assertEqual(replace.call_args_list, [unittest.mock.call(self.page, code) for code in files.values()])
+
+    def test_missing_file_stops_before_writing_to_another_editor(self):
+        with patch.object(fcc, "wait_for_editable_editor"), \
+                patch.object(fcc, "choose_file_tab", return_value=False), \
+                patch.object(fcc, "replace_editor_code") as replace, redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(fcc.UnsupportedChallenge, "找不到 html 文件标签"):
+                fcc.write_code(self.page, {"html": "<h1/>\n", "js": "let x;\n"})
+        replace.assert_not_called()
+
+    def test_project_preview_uses_start_coding_inside_its_dialog(self):
+        dialogs = self.page.get_by_role.return_value.filter.return_value
+        dialogs.count.return_value = 1
+        dialog = dialogs.nth.return_value
+        dialog.is_visible.return_value = True
+        start = dialog.get_by_role.return_value
+        start.count.return_value = 1
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(fcc.dismiss_project_preview_modal(self.page))
+        start.click.assert_called_once()
+        dialog.wait_for.assert_called_once_with(state="hidden", timeout=10000)
+
+
 class EditorReplacementTests(unittest.TestCase):
     def setUp(self):
         self.page = Mock()

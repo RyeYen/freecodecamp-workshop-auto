@@ -33,6 +33,19 @@ BASE_DIR = Path(__file__).resolve().parent
 PROFILE_DIR = BASE_DIR / ".fcc_browser_profile"
 CACHE_DIR = BASE_DIR / ".fcc_curriculum_cache"
 PROGRESS_FILE = BASE_DIR / ".fcc_progress.json"
+FILE_PATTERNS = {
+    "html": r"(?:\.html?\b|\bhtml\b)",
+    "css": r"(?:\.css\b|\bcss\b)",
+    "js": r"(?:\.js\b|\bjavascript\b)",
+    "ts": r"(?:\.ts\b|\btypescript\b)",
+    "jsx": r"(?:\.jsx\b|\bjsx\b)",
+    "tsx": r"(?:\.tsx\b|\btsx\b)",
+    "py": r"(?:\.py\b|\bpython\b)",
+}
+EDITOR_MODES = {
+    "html": "html", "css": "css", "js": "javascript", "jsx": "javascript",
+    "ts": "typescript", "tsx": "typescript", "py": "python",
+}
 
 
 class UnsupportedChallenge(RuntimeError):
@@ -265,6 +278,30 @@ def dismiss_donation_modal(page, timeout_ms: int = 45000) -> bool:
     )
 
 
+def dismiss_project_preview_modal(page) -> bool:
+    """关闭 Workshop 首次展示的项目预览，仅点击该对话框中的 Start coding。"""
+    dialogs = page.get_by_role("dialog").filter(
+        has_text=re.compile(r"(?:Here's|Here is) a preview of what you will build", re.I)
+    )
+    for index in range(min(dialogs.count(), 3)):
+        dialog = dialogs.nth(index)
+        if not dialog.is_visible():
+            continue
+        start = dialog.get_by_role("button", name=re.compile(r"^Start coding!?$", re.I))
+        if start.count() != 1:
+            raise UnsupportedChallenge("项目预览已打开，但找不到唯一的 Start coding 按钮。")
+        start.click(timeout=8000)
+        dialog.wait_for(state="hidden", timeout=10000)
+        print("    已关闭项目预览，开始编辑。")
+        return True
+    return False
+
+
+def dismiss_known_modals(page) -> None:
+    dismiss_donation_modal(page)
+    dismiss_project_preview_modal(page)
+
+
 def wait_for_submission_confirmation(
     page, block: str, previous: str, *, is_final: bool, timeout_ms: int = 85000,
     course: str | None = None,
@@ -322,24 +359,39 @@ def wait_for_submission_confirmation(
     raise UnsupportedChallenge("提交后未跳转至下一题（已等待并处理捐赠弹窗）。")
 
 
-def choose_file_tab(page, language: str) -> bool:
-    """多文件 Workshop：尝试切换到对应语言的文件标签。"""
-    patterns = {
-        "html": r"(?:\.html\b|\bhtml\b)",
-        "css": r"(?:\.css\b|\bcss\b)",
-        "js": r"(?:\.js\b|\bjavascript\b)",
-        "ts": r"(?:\.ts\b|\btypescript\b)",
-        "jsx": r"(?:\.jsx\b|\bjsx\b)",
-        "tsx": r"(?:\.tsx\b|\btsx\b)",
-        "py": r"(?:\.py\b|\bpython\b)",
-    }
-    rx = re.compile(patterns[language], re.I)
-    for role in ("tab", "button"):
-        loc = page.get_by_role(role, name=rx)
-        if loc.count() == 1 and loc.first.is_visible():
-            loc.first.click()
+def choose_file_tab(page, language: str, timeout_ms: int = 45000) -> bool:
+    """等待文件标签可用，已展开时保持打开，避免再次点击反而收起。"""
+    rx = re.compile(FILE_PATTERNS[language], re.I)
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        dismiss_known_modals(page)
+        for role in ("tab", "button"):
+            loc = page.get_by_role(role, name=rx)
+            visible = [loc.nth(i) for i in range(min(loc.count(), 10)) if loc.nth(i).is_visible()]
+            if len(visible) > 1:
+                raise UnsupportedChallenge(f"发现多个可见的 {language} 文件标签，无法可靠区分。")
+            if not visible or not visible[0].is_enabled():
+                continue
+            tab = visible[0]
+            if tab.get_attribute("aria-expanded") != "true" and tab.get_attribute("aria-selected") != "true":
+                tab.click(timeout=8000)
             return True
+        page.wait_for_timeout(300)
     return False
+
+
+def monaco_roots_for_language(page, language: str | None):
+    if language is None:
+        return page.locator(".monaco-editor")
+    # 文件名优先；否则使用 Monaco 容器公开的语言标记。
+    roots = page.locator(".monaco-editor").filter(
+        has=page.get_by_role("textbox", name=re.compile(FILE_PATTERNS[language], re.I))
+    )
+    if roots.count():
+        return roots
+    return page.locator(
+        f'.react-monaco-editor-container[data-mode-id="{EDITOR_MODES[language]}"] .monaco-editor'
+    )
 
 
 def editor_diagnostics(page) -> str:
@@ -355,6 +407,8 @@ def editor_diagnostics(page) -> str:
         "code-tab": page.get_by_role("tab", name=re.compile(r"^Code$", re.I)),
         "donation-dialog": page.get_by_role("dialog").filter(has_text=re.compile(r"Become a Supporter|Help millions of people learn|Support us", re.I)),
         "ask-later-button": page.get_by_role("button", name=re.compile(r"^Ask me later$", re.I)),
+        "project-preview": page.get_by_role("dialog").filter(has_text=re.compile(r"preview of what you will build", re.I)),
+        "file-tabs": page.locator(".monaco-editor-tabs button"),
     }
     lines = [
         f"recorded_at: {datetime.now().isoformat(timespec='seconds')}",
@@ -394,24 +448,38 @@ def editor_diagnostics(page) -> str:
         lines.append("visible_buttons: " + " | ".join(names[:20]))
     except Exception:
         pass
+    try:
+        tabs = page.locator(".monaco-editor-tabs button").all()
+        lines.append("file_tab_states: " + " | ".join(
+            f"{tab.inner_text(timeout=700).strip()}: expanded={tab.get_attribute('aria-expanded')}"
+            for tab in tabs[:10]
+        ))
+    except Exception:
+        pass
     return "\n".join(lines) + "\n"
 
 
-def wait_for_editable_editor(page, timeout_ms: int = 45000):
+def wait_for_editable_editor(page, timeout_ms: int = 45000, *, language: str | None = None):
     """定位 Monaco/CodeMirror 编辑器；优先使用 freeCodeCamp 官方选择器。"""
     deadline = time.monotonic() + timeout_ms / 1000
     code_tab_clicked = False
     last_error = None
 
     while time.monotonic() < deadline:
-        dismiss_donation_modal(page)
+        dismiss_known_modals(page)
+        roots = monaco_roots_for_language(page, language)
+        official = (roots.get_by_role("textbox", name=re.compile("editor content", re.I))
+                    if language else page.get_by_role("textbox", name=re.compile("editor content", re.I)))
+        codemirror = page.locator(".cm-editor .cm-content[contenteditable='true']")
+        if language:
+            codemirror = codemirror.and_(page.get_by_role("textbox", name=re.compile(FILE_PATTERNS[language], re.I)))
         # 免费课程是 React SPA；networkidle 不一定成立，所以循环等编辑器挂载。
         candidates = [
-            ("freeCodeCamp official textbox", page.get_by_role("textbox", name=re.compile("editor content", re.I)), "focus"),
-            ("Monaco textbox", page.locator(".monaco-editor [role='textbox']"), "focus"),
-            ("Monaco view-lines", page.locator(".monaco-editor .view-lines"), "click"),
-            ("Monaco root", page.locator(".monaco-editor"), "click"),
-            ("CodeMirror", page.locator(".cm-editor .cm-content[contenteditable='true']"), "click"),
+            ("freeCodeCamp official textbox", official, "focus"),
+            ("Monaco textbox", roots.locator("[role='textbox']"), "focus"),
+            ("Monaco view-lines", roots.locator(".view-lines"), "click"),
+            ("Monaco root", roots, "click"),
+            ("CodeMirror", codemirror, "click"),
         ]
         for name, locator, action in candidates:
             try:
@@ -449,7 +517,7 @@ def wait_for_editable_editor(page, timeout_ms: int = 45000):
 
     # 只有在编辑器主区域已经可见、但辅助输入框没有可访问 role 的情况下才尝试直接 focus。
     try:
-        root = page.locator('.monaco-editor').first
+        root = monaco_roots_for_language(page, language).first
         if root.count() and root.is_visible():
             raw_input = root.locator('textarea.inputarea, [contenteditable="true"]').first
             if raw_input.count():
@@ -462,7 +530,8 @@ def wait_for_editable_editor(page, timeout_ms: int = 45000):
     hint = "当前页面可能未加载出编辑器、显示了登录/人机验证页，或 Code 标签页未打开。"
     if last_error:
         hint += f" 最后一次定位错误：{type(last_error).__name__}。"
-    raise UnsupportedChallenge("45 秒内没有找到可编辑的代码区域。" + hint)
+    target = f" {language} 文件的" if language else ""
+    raise UnsupportedChallenge(f"{timeout_ms / 1000:g} 秒内没有找到{target}可编辑的代码区域。" + hint)
 
 
 def monaco_model_contents(page, replacement: str | None = None) -> str | None:
@@ -489,6 +558,12 @@ def monaco_model_contents(page, replacement: str | None = None) -> str | None:
             const key = Object.keys(node).find(key => key.startsWith('__reactFiber$'));
             for (let fiber = node[key], depth = 0; fiber && depth < 50; fiber = fiber.return, depth++) {
                 const candidates = [fiber.stateNode?.editor, fiber.memoizedProps?.editorRef?.current];
+                // 多文件页面的公共 editorRef 可能指向另一个文件；各组件自身的 ref
+                // 才持有该文件实例。只检查这些 ref，仍要求 DOM 根节点精确匹配。
+                for (let hook = fiber.memoizedState, index = 0; hook && index < 40; hook = hook.next, index++) {
+                    const ref = hook.memoizedState?.current;
+                    candidates.push(ref, ref?.monaco?.editor);
+                }
                 for (const editor of candidates) {
                     if (matches(editor)) return use(editor);
                 }
@@ -554,14 +629,17 @@ def replace_editor_code(page, code: str) -> str:
 
 
 def write_code(page, files: dict[str, str]) -> None:
-    dismiss_donation_modal(page)
+    dismiss_known_modals(page)
+    if len(files) > 1:
+        print("    等待课程页面和多文件编辑器加载……")
+        wait_for_editable_editor(page)
     for language, code in files.items():
         if len(files) > 1 and not choose_file_tab(page, language):
             raise UnsupportedChallenge(
-                f"有多个源码文件，但找不到 {language} 文件标签；停止以避免填写到错误文件。"
+                f"等待后仍找不到 {language} 文件标签；页面可能未加载完成或格式不受支持。"
             )
 
-        editor_type = wait_for_editable_editor(page)
+        editor_type = wait_for_editable_editor(page, language=language if len(files) > 1 else None)
         method = replace_editor_code(page, code)
         print(f"    使用 {editor_type} 定位，通过{method}替换并核对 {language}（{len(code)} 字符）")
 
@@ -571,7 +649,7 @@ def click_visible_button(page, expressions: list[str], timeout_ms: int = 18000) 
     until = time.monotonic() + timeout_ms / 1000
     patterns = [re.compile(exp, re.I) for exp in expressions]
     while time.monotonic() < until:
-        dismiss_donation_modal(page)
+        dismiss_known_modals(page)
         for pat in patterns:
             buttons = page.get_by_role("button", name=pat)
             for i in range(min(buttons.count(), 8)):
